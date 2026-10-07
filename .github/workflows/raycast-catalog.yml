@@ -1,0 +1,122 @@
+name: Raycast extension catalog
+
+# The Simple Notch launcher's store searches a catalog made from github.com/raycast/extensions, not Raycast's
+# store API. This rebuilds it daily and publishes it on the `raycast-catalog` branch, which
+# the app downloads from raw.githubusercontent.com. A second job then prebuilds the extensions whose source
+# changed (Scripts/raycast-catalog/mirror.js) into one zip each on the rolling release `raycast-mirror`, writes
+# the index `raycast-mirror.json` next to the catalog and marks the catalog's entries `prebuilt`; the app installs
+# those by downloading the zip and falls back to building from source.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Extensions to prebuild in this run"
+        default: "300"
+      minutes:
+        description: "Time budget for prebuilding, in minutes"
+        default: "240"
+  push:
+    branches: [main]
+    paths:
+      - "Scripts/raycast-catalog/**"
+      - "Scripts/raycast-compat/build-source.js"
+      - "priority.md"
+      - ".github/workflows/raycast-catalog.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: raycast-catalog
+  cancel-in-progress: true
+
+env:
+  ESBUILD_VERSION: 0.24.2  # the version the app installs (NodeSidecar.esbuildVersion in Simple Notch)
+
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch every extension's package.json
+        run: |
+          git clone --quiet --filter=blob:none --no-checkout --depth 1 https://github.com/raycast/extensions upstream
+          cd upstream
+          git sparse-checkout init --no-cone
+          git sparse-checkout set 'extensions/*/package.json'
+          git checkout --quiet
+          echo "upstream=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Fetch the mirror's index from the last run
+        run: |
+          mkdir -p out
+          if git fetch --quiet --depth 1 origin raycast-catalog 2>/dev/null && git show FETCH_HEAD:raycast-mirror.json > out/raycast-mirror.json 2>/dev/null; then
+            echo "index: $(node -e 'const i=require("./out/raycast-mirror.json");console.log(Object.keys(i.extensions||{}).length+" packages, updated "+i.updatedAt)')"
+          else
+            echo "no index yet"; rm -f out/raycast-mirror.json
+          fi
+      - name: Build the catalog
+        run: node Scripts/raycast-catalog/build.js --repo upstream --out out/raycast-catalog.json --mirror out/raycast-mirror.json
+      - name: Publish on the raycast-catalog branch
+        run: |
+          cd out
+          git init --quiet -b raycast-catalog
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add raycast-catalog.json
+          [ -f raycast-mirror.json ] && git add raycast-mirror.json
+          git commit --quiet -m "Catalog from raycast/extensions@${upstream:0:10}"
+          git push --force --quiet "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" raycast-catalog
+
+  mirror:
+    needs: catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install esbuild
+        run: |
+          mkdir -p tools && cd tools
+          npm init -y > /dev/null
+          # --ignore-scripts keeps the JS launcher in bin (the install script would replace it with the binary); build-source.js runs it through node, as the app does
+          npm install --no-audit --no-fund --loglevel=error --ignore-scripts "esbuild@$ESBUILD_VERSION"
+          node ./node_modules/.bin/esbuild --version
+      - name: Fetch the catalog and the index
+        run: |
+          mkdir -p out
+          git fetch --quiet --depth 1 origin raycast-catalog
+          git show FETCH_HEAD:raycast-catalog.json > out/raycast-catalog.json
+          git show FETCH_HEAD:raycast-mirror.json > out/raycast-mirror.json 2>/dev/null || rm -f out/raycast-mirror.json
+      - name: Prebuild changed extensions and upload them
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node Scripts/raycast-catalog/mirror.js --catalog out/raycast-catalog.json --index out/raycast-mirror.json --out work \
+            --node "$(command -v node)" --esbuild "$PWD/tools/node_modules/.bin/esbuild" --priority priority.md \
+            --limit "${{ github.event.inputs.limit || '300' }}" --minutes "${{ github.event.inputs.minutes || '240' }}"
+      - name: Publish the index and the annotated catalog
+        if: always()
+        run: |
+          [ -s out/raycast-mirror.json ] && [ -s out/raycast-catalog.json ] || { echo "nothing to publish"; exit 0; }
+          # mirror.js annotates the catalog when it finishes; after an interrupted run the index still has every package.
+          node -e '
+            const fs = require("node:fs"), { annotate } = require("./Scripts/raycast-catalog/annotate");
+            const catalog = JSON.parse(fs.readFileSync("out/raycast-catalog.json", "utf8"));
+            const n = annotate(catalog, JSON.parse(fs.readFileSync("out/raycast-mirror.json", "utf8")));
+            fs.writeFileSync("out/raycast-catalog.json", JSON.stringify(catalog));
+            console.log(n + " entries prebuilt");'
+          cd out
+          git init --quiet -b raycast-catalog
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add raycast-catalog.json raycast-mirror.json
+          git commit --quiet -m "Catalog and mirror index ($(date -u +%Y-%m-%dT%H:%MZ))"
+          git push --force --quiet "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" raycast-catalog
